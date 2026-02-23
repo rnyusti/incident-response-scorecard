@@ -420,6 +420,7 @@
         <div class="controls">
             <button onclick="addIncident()" id="addIncidentBtn">➕ Add Incident</button>
             <button onclick="saveProgress()" id="saveProgressBtn" style="background: #28a745; font-weight: bold;">💾 Save Progress</button>
+            <button onclick="refreshFromGitHub()" style="background: #17a2b8;">🔄 Refresh Data</button>
             <button onclick="resetData()" id="resetDataBtn">🔄 Clear All Data</button>
             <button onclick="saveDocument()">📥 Save Document</button>
             <button onclick="downloadCSV()">📊 Export as CSV</button>
@@ -618,43 +619,116 @@
 
                 const url = `https://api.github.com/repos/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/contents/${GITHUB_CONFIG.dataFile}`;
                 
-                // Get current SHA
+                // Get current SHA - always fetch fresh
                 let sha = null;
-                try {
-                    const getResponse = await fetch(url, {
-                        headers: { 'Authorization': `token ${authToken}` }
-                    });
-                    if (getResponse.ok) {
-                        const data = await getResponse.json();
-                        sha = data.sha;
-                    } else if (getResponse.status !== 404) {
-                        console.warn('Failed to get file:', getResponse.status);
+                let retryCount = 0;
+                const maxRetries = 3;
+                
+                while (retryCount < maxRetries) {
+                    try {
+                        const getResponse = await fetch(url, {
+                            headers: { 
+                                'Authorization': `token ${authToken}`,
+                                'Cache-Control': 'no-cache'
+                            }
+                        });
+                        if (getResponse.ok) {
+                            const data = await getResponse.json();
+                            sha = data.sha;
+                            
+                            // Check if remote data is newer - merge if needed
+                            try {
+                                const remoteContent = JSON.parse(atob(data.content));
+                                const remoteSavedAt = new Date(remoteContent.savedAt || 0);
+                                const localSavedAt = new Date(fileContent.savedAt);
+                                
+                                // If remote is significantly newer (>10 seconds), warn user
+                                if (remoteSavedAt > localSavedAt && (remoteSavedAt - localSavedAt) > 10000) {
+                                    console.log('Remote data is newer, merging...');
+                                    // Merge: prefer local data but keep remote incidents if longer
+                                    if (remoteContent.incidents && remoteContent.incidents.length > incidents.length) {
+                                        incidents = remoteContent.incidents;
+                                    }
+                                }
+                            } catch (e) {
+                                console.log('Could not parse remote content for merge');
+                            }
+                            
+                            break;
+                        } else if (getResponse.status === 404) {
+                            sha = null;
+                            break;
+                        } else {
+                            console.warn('Failed to get file:', getResponse.status);
+                        }
+                    } catch (e) {
+                        console.log('Could not fetch existing file:', e.message);
                     }
-                } catch (e) {
-                    console.log('Could not fetch existing file');
+                    
+                    retryCount++;
+                    if (retryCount < maxRetries) {
+                        await new Promise(resolve => setTimeout(resolve, 1000));
+                    }
                 }
 
-                // Push to GitHub
-                const response = await fetch(url, {
-                    method: 'PUT',
-                    headers: {
-                        'Authorization': `token ${authToken}`,
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({
-                        message: `Update scorecard ${currentMonth} - ${currentUser}`,
-                        content: btoa(JSON.stringify(fileContent, null, 2)),
-                        ...(sha && { sha })
-                    })
-                });
+                // Push to GitHub with retry logic for conflicts
+                let pushSuccess = false;
+                retryCount = 0;
+                
+                while (!pushSuccess && retryCount < maxRetries) {
+                    const response = await fetch(url, {
+                        method: 'PUT',
+                        headers: {
+                            'Authorization': `token ${authToken}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({
+                            message: `Update scorecard ${currentMonth} - ${currentUser}`,
+                            content: btoa(JSON.stringify(fileContent, null, 2)),
+                            ...(sha && { sha })
+                        })
+                    });
 
-                if (response.ok) {
-                    console.log('✓ Successfully synced to GitHub');
-                    updateGitHubStatus();
-                } else {
-                    const error = await response.json().catch(() => ({}));
-                    console.error('GitHub sync failed:', response.status, error);
-                    alert(`Error syncing to GitHub: ${response.status}\n\nMake sure your token has "repo" permission!\n\nError: ${error.message || 'Unknown'}`);
+                    if (response.ok) {
+                        console.log('✓ Successfully synced to GitHub');
+                        pushSuccess = true;
+                        updateGitHubStatus();
+                    } else if (response.status === 409) {
+                        // Conflict - retry with fresh SHA
+                        console.log('Conflict detected, retrying with fresh SHA...');
+                        retryCount++;
+                        
+                        // Fetch latest SHA
+                        try {
+                            const getResponse = await fetch(url, {
+                                headers: { 
+                                    'Authorization': `token ${authToken}`,
+                                    'Cache-Control': 'no-cache'
+                                }
+                            });
+                            if (getResponse.ok) {
+                                const data = await getResponse.json();
+                                sha = data.sha;
+                            }
+                        } catch (e) {
+                            console.error('Failed to get updated SHA:', e);
+                        }
+                        
+                        if (retryCount < maxRetries) {
+                            await new Promise(resolve => setTimeout(resolve, 1000));
+                        } else {
+                            const error = await response.json().catch(() => ({}));
+                            console.error('Conflict persists after retries:', error);
+                            alert(`Sync conflict detected.\n\nAnother user may have updated the data.\n\nPlease refresh the page to get the latest data.`);
+                        }
+                    } else {
+                        const error = await response.json().catch(() => ({}));
+                        console.error('GitHub sync failed:', response.status, error);
+                        if (retryCount === 0) {
+                            alert(`Error syncing to GitHub: ${response.status}\n\nError: ${error.message || 'Unknown'}`);
+                        }
+                        break;
+                    }
                 }
             } catch (error) {
                 console.error('GitHub sync error:', error);
@@ -667,7 +741,12 @@
         async function loadFromGitHub() {
             try {
                 const url = `https://api.github.com/repos/${GITHUB_CONFIG.owner}/${GITHUB_CONFIG.repo}/contents/${GITHUB_CONFIG.dataFile}`;
-                const response = await fetch(url);
+                const response = await fetch(url, {
+                    headers: { 
+                        'Cache-Control': 'no-cache',
+                        'Pragma': 'no-cache'
+                    }
+                });
                 
                 if (response.ok) {
                     const data = await response.json();
@@ -679,12 +758,55 @@
                         localStorage.setItem(getStorageKey('incidents'), JSON.stringify(incidents));
                         localStorage.setItem(getStorageKey('scoreData'), JSON.stringify(scoreData));
                         console.log('✓ Data loaded from GitHub');
+                        return true;
                     }
+                } else if (response.status === 404) {
+                    console.log('No data found in GitHub for this month, using local data');
                 } else {
-                    console.log('No data found in GitHub, using local data');
+                    console.log('Could not load from GitHub:', response.status);
                 }
+                return false;
             } catch (error) {
                 console.log('Could not load from GitHub:', error.message);
+                return false;
+            }
+        }
+
+        async function refreshFromGitHub() {
+            const btn = event?.target;
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = '🔄 Refreshing...';
+            }
+            
+            const loaded = await loadFromGitHub();
+            
+            if (loaded) {
+                incidentPage = 1;
+                summaryPage = 1;
+                buildHeader();
+                buildRows();
+                loadData();
+                applyApplicabilityToAll();
+                updateAllCalculations();
+                
+                if (btn) {
+                    btn.textContent = '✓ Refreshed!';
+                    setTimeout(() => {
+                        btn.textContent = '🔄 Refresh Data';
+                        btn.disabled = false;
+                    }, 2000);
+                }
+                alert('✓ Data refreshed from GitHub');
+            } else {
+                if (btn) {
+                    btn.textContent = '✗ Refresh Failed';
+                    setTimeout(() => {
+                        btn.textContent = '🔄 Refresh Data';
+                        btn.disabled = false;
+                    }, 2000);
+                }
+                alert('Could not refresh data from GitHub');
             }
         }
 
